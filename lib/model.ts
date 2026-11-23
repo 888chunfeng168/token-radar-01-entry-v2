@@ -13,6 +13,9 @@
 //                     (global median when cat has fewer than 3 peers)
 //   adjustments     = growth x maturity x scale x chains, clamped to [0.70, 1.35]
 //   cap(p)          = min($10B, 2 x largest peer market cap in the category)
+// The cap exists because a median ratio can still overstate a category whose
+// biggest token is small: no protocol's hypothetical token may be worth more
+// than twice what its category's largest real token is worth today.
 
 export interface Protocol {
   slug: string;

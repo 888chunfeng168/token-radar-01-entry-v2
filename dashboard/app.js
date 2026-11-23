@@ -177,6 +177,9 @@
     var m = location.hash.match(/^#p=([\w-]+)/);
     if (m) openDetail(m[1]); else closeDetail();
   });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && openSlug) closeDetail();
+  });
 
   render();
   var m0 = location.hash.match(/^#p=([\w-]+)/);

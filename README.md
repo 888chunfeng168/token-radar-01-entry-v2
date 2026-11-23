@@ -21,7 +21,8 @@ mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input <snapshot.json|dir>
 Node 22+, standard library only, no network. `main.ts` writes `out/board.json`
 (the ranked board), `out/data.js` (the dashboard's data), `out/dashboard/`,
 `out/screenshots/` and `out/dossier.json`. Two runs on the same snapshot write
-the same bytes. Open `out/dashboard/index.html` in a browser.
+the same bytes (verified: `board.json`, `data.js` and `dossier.json` are
+byte-identical across runs). Open `out/dashboard/index.html` in a browser.
 
 ## What it ranks
 

@@ -4,7 +4,10 @@
 // in lib/model.ts, writes the ranked board to /output/board.json, writes the
 // dashboard's data beside the page, copies dashboard/ and screenshots/ to
 // /output, and writes /output/dossier.json with the vendored make.fun
-// library. Two runs on the same snapshot write the same bytes.
+// library. Two runs on the same snapshot write the same bytes: the program
+// reads nothing but the snapshot, keeps no state between runs, and sorts
+// every tie deterministically (value, then TVL, then slug), so the output is
+// a pure function of the input file.
 //
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input <snapshot.json|dir>
 
