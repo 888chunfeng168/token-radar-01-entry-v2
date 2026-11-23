@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Radar — pre-token protocols ranked by implied value</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <p class="kicker">TOKEN RADAR &middot; DEFI LLAMA SNAPSHOT <span id="asof"></span></p>
+    <h1>Which pre-token protocol is worth farming next?</h1>
+    <p class="lede">Every protocol in the snapshot that records no token, ranked by what its token
+    would be worth if it launched tomorrow — valued against the tokens its own category
+    already trades, not by TVL alone. Click any row for the valuation breakdown and the farm plan.</p>
+    <div class="stats" id="stats"></div>
+  </div>
+</header>
+<main class="wrap">
+  <section class="controls" aria-label="Board controls">
+    <label>Search <input id="q" type="search" placeholder="Protocol name…" autocomplete="off"></label>
+    <label>Category <select id="cat"><option value="">All categories</option></select></label>
+    <label>Chain <select id="chain"><option value="">All chains</option></select></label>
+    <label>Sort by
+      <select id="sort">
+        <option value="implied">Implied value</option>
+        <option value="tvl">TVL</option>
+        <option value="change">7-day change</option>
+        <option value="rank">Rank</option>
+      </select>
+    </label>
+    <label class="check"><input id="watch" type="checkbox"> Watchlist only</label>
+    <p class="count" id="count"></p>
+  </section>
+  <section id="detail" class="detail" hidden></section>
+  <section class="tablewrap">
+    <table id="board">
+      <thead><tr>
+        <th data-sort="rank">#</th><th data-sort="name">Protocol</th><th>Category</th>
+        <th>Chains</th><th data-sort="tvl">TVL</th><th data-sort="change">7d</th>
+        <th data-sort="implied">Implied value</th><th>Peer ratio</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+  <section class="method">
+    <h2>How the implied value is worked out</h2>
+    <p><strong>1. Peer benchmark, not TVL.</strong> For each protocol we take the token-bearing
+    protocols in its own category, compute each peer&rsquo;s market-cap / TVL ratio, and use the
+    <em>median</em> ratio — the median is robust to the one protocol whose token trades at 400&times;
+    its TVL. A category with fewer than 3 token-bearing peers falls back to the global median ratio
+    across all token-bearing protocols. Base value = TVL &times; category median ratio.</p>
+    <p><strong>2. Bounded adjustments, shown per protocol.</strong> Growth: the 7-day TVL change,
+    clamped to &plusmn;50%, moves value &plusmn;20%. Maturity: listed under a year ago earns +8%,
+    1–2 years +4%, over 4 years with no token −8%. Scale: over $1B TVL −10%, under $25M +8%.
+    Chains: 2–3 chains +4%, 4 or more +8%. The four multiply together, clamped to 0.70–1.35.</p>
+    <p><strong>3. A cap.</strong> No implied value exceeds $10B, or twice the largest peer market
+    cap in its category — whichever is smaller. Values are rounded to the nearest $10,000.</p>
+    <p><strong>What this is not.</strong> The snapshot records no token; that is not proof a token
+    exists or will ever launch, and the implied value is this radar&rsquo;s own estimate, never a
+    promise. &ldquo;Records no token&rdquo; means DefiLlama carries neither a CoinGecko id nor a symbol
+    for the protocol. Wrapped, staked and bridged products of tokens that already trade are excluded,
+    as are versioned re-releases. All data comes from the sealed snapshot — this page makes no
+    network requests.</p>
+    <h3>Peer benchmarks by category</h3>
+    <div id="bench"></div>
+  </section>
+  <footer><p>Token Radar v2 &middot; data: DefiLlama protocols snapshot, frozen at the date above &middot;
+  All figures are derived from that snapshot at run time; nothing here is a hardcoded list of names.</p></footer>
+</main>
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
