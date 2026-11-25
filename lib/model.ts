@@ -1,23 +1,36 @@
-// Token Radar v2 — the valuation model, the board builder and the farm plans.
+// Token Radar v3 — the value model.
 //
-// The model answers one question: if a protocol that records no token issued
-// one tomorrow, what would it be worth? It never trusts a single number. It
-// benchmarks every protocol against token-bearing peers in its own category,
-// then adjusts that benchmark for what the snapshot actually says about the
-// protocol: its growth, its age, its scale and how many chains it runs on.
-// Everything below is derived from the sealed snapshot at run time — no
-// hardcoded list of names, no hardcoded values, no network.
+// The board answers one question: which pre-token protocol is worth farming
+// next, and what is its token worth if it launched tomorrow. Everything is
+// derived from the snapshot at run time: no list of names and no value is
+// hardcoded, so the same program ranks a future snapshot's protocols.
 //
-//   impliedValue(p) = min( cap(p), TVL(p) x peerRatio(category(p)) x adjustments(p) )
-//   peerRatio(cat)  = median mcap/TVL over token-bearing peers in cat
-//                     (global median when cat has fewer than 3 peers)
-//   adjustments     = growth x maturity x scale x chains, clamped to [0.70, 1.35]
-//   cap(p)          = min($10B, 2 x largest peer market cap in the category)
-// The cap exists because a median ratio can still overstate a category whose
-// biggest token is small: no protocol's hypothetical token may be worth more
-// than twice what its category's largest real token is worth today.
+// The model, in four steps:
+//   1. Peer benchmark — the category's own market. For each category, the
+//      median market-cap / TVL ratio of its token-bearing peers (three or
+//      more peers, else the global median). The median is robust: one peer
+//      in this snapshot trades at 400x its TVL and would wreck a mean.
+//   2. Bounded adjustments — growth, momentum against the category,
+//      token-less tenure, scale and chain breadth. Each is small, each is
+//      shown in the detail view, and their product is clamped to 0.70–1.40,
+//      so the peer benchmark does the work, never the adjustments.
+//   3. A cap — no value above $10B, or twice the largest peer market cap
+//      in its category, whichever is smaller.
+//   4. A readiness score (0–100) — how farmable this protocol looks right
+//      now: tenure, momentum, scale, chain breadth and benchmark strength.
+//      It is a second dimension, not a second value: the board still sorts
+//      by implied value.
+//
+// Farm plans come from dashboard/farm.js, the one source of truth the
+// dashboard also uses, so the board and the page can never disagree.
 
-export interface Protocol {
+import '../dashboard/farm.js';
+
+const Farm = (globalThis as any).Farm as {
+  stepsFor: (p: { name: string; category: string | null; chains: string[] }) => string[];
+};
+
+export interface SnapshotProtocol {
   slug: string;
   name: string;
   category: string | null;
@@ -34,68 +47,43 @@ export interface Snapshot {
   as_of: string;
   source: string;
   floor_usd: number;
-  protocols: Protocol[];
+  protocols: SnapshotProtocol[];
   watchlist: string[];
 }
 
-export interface Adjustments {
-  growth: number;
-  maturity: number;
-  scale: number;
-  chains: number;
-  total: number;
-}
-
-export interface Row {
+export interface BoardRow {
   slug: string;
   name: string;
   rank: number;
   implied_value_usd: number;
   farm_steps: string[];
-  category: string;
+  category: string | null;
   chains: string[];
   tvl_usd: number;
   change_7d: number | null;
   listed_at: string | null;
   watchlist: boolean;
+  readiness: number;
+  readiness_parts: { tenure: number; momentum: number; scale: number; chains: number; benchmark: number };
+  benchmark_ratio: number;
+  benchmark_peers: number;
   base_value_usd: number;
-  peer_ratio: number;
-  peer_count: number;
-  peer_fallback: boolean;
-  peer_max_mcap_usd: number | null;
-  adjustments: Adjustments;
-  capped: boolean;
+  adjustment: number;
+  category_median_change: number | null;
+  factors: { growth: number; momentum: number; tenure: number; scale: number; chains: number };
 }
 
-export interface Radar {
-  as_of: string;
-  rows: Row[];
-  watchlist_size: number;
-  early_size: number;
-  live_size: number;
-  global_peer_ratio: number;
-  benchmarks: { category: string; peers: number; ratio: number; fallback: boolean }[];
+export interface CategoryBench {
+  peers: number;
+  median_ratio: number;
+  median_change: number | null;
+  max_peer_mcap: number | null;
 }
 
-/** The snapshot's date, parsed as a UTC day; the maturity clock runs from it. */
-const AS_OF_MS = (asOf: string): number => Date.parse(`${asOf}T00:00:00Z`);
-
-/** Median of a non-empty list; the middle value, or the mean of the middle two. */
-export function median(values: number[]): number {
-  const s = [...values].sort((a, b) => a - b);
-  const m = s.length >> 1;
-  return s.length % 2 === 1 ? s[m]! : (s[m - 1]! + s[m]!) / 2;
-}
-
-/** A protocol records no token when DefiLlama carries neither a CoinGecko id nor a symbol. */
-export function recordsNoToken(p: Protocol): boolean {
-  return p.gecko_id === null && p.symbol === null;
-}
-
-const VERSIONED_NAME = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
-const WRAPPED_OR_STAKED = /\b(wrapped|staked|staking)\b/i;
-const EXCHANGE_PREFIX = /^(Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)\b/;
-/** Categories that are a wrapped, staked or bridged product of a token that already trades. */
+// The watchlist's own exclusion rule, applied with only the snapshot's ten
+// fields (parentProtocol is not one of them): a wrapped, staked or bridged
+// product of a token that already trades, a versioned re-release, or an
+// exchange's own product is not a protocol still waiting on a launch.
 const EXCLUDED_CATEGORIES = new Set([
   'Bridge',
   'Canonical Bridge',
@@ -104,358 +92,267 @@ const EXCLUDED_CATEGORIES = new Set([
   'Restaked BTC',
   'CEX',
 ]);
+const EXCHANGE_NAMES = new Set(['Binance', 'Coinbase', 'Bybit', 'Kraken', 'Bitget', 'OKX', 'Bitfinex', 'Gemini']);
+const VERSION_MARKER = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
+const WRAPPED_WORD = /\b(wrapped|staked|staking)\b/i;
 
-/**
- * A pre-token candidate: it records no token, is not a versioned re-release,
- * and is not a wrapped, staked or bridged product of a token that trades.
- * This is the watchlist's own rule, applied to the whole snapshot so the
- * board can reach below the $50M floor.
- */
-export function isPreToken(p: Protocol): boolean {
-  if (!recordsNoToken(p)) return false;
-  if (VERSIONED_NAME.test(p.name)) return false;
+export function isPreToken(p: SnapshotProtocol): boolean {
+  if (p.gecko_id !== null || p.symbol !== null) return false;
   if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return false;
-  if (WRAPPED_OR_STAKED.test(p.name)) return false;
-  if (EXCHANGE_PREFIX.test(p.name)) return false;
+  if (VERSION_MARKER.test(p.name)) return false;
+  if (WRAPPED_WORD.test(p.name)) return false;
+  if (EXCHANGE_NAMES.has(p.name.split(' ')[0] as string)) return false;
   return true;
 }
 
-/** The snapshot as a typed object; throws on a shape it does not recognise. */
-export function parseSnapshot(text: string): Snapshot {
-  const data = JSON.parse(text) as Snapshot;
-  if (!Array.isArray(data.protocols) || !Array.isArray(data.watchlist)) {
-    throw new Error('token radar: snapshot has no protocols[] or watchlist[]');
-  }
-  return data;
+function median(values: number[]): number {
+  const s = [...values].sort((a, b) => a - b);
+  const n = s.length;
+  if (n === 0) return 0;
+  return n % 2 === 1 ? s[(n - 1) / 2]! : (s[n / 2 - 1]! + s[n / 2]!) / 2;
 }
 
-/**
- * Growth adjustment: the 7-day TVL change, clamped to +/-50%, mapped linearly
- * to a factor from 0.80 (falling fast) to 1.20 (growing fast). No 7-day figure
- * means no adjustment — the protocol is judged on its size alone.
- */
-export function growthFactor(change7d: number | null): number {
-  if (change7d === null || !Number.isFinite(change7d)) return 1;
-  const clamped = Math.max(-50, Math.min(50, change7d));
-  return 1 + (clamped / 50) * 0.2;
+function clamp(x: number, lo: number, hi: number): number {
+  return x < lo ? lo : x > hi ? hi : x;
 }
 
-/**
- * Maturity adjustment: a protocol that has run a long time with no token is
- * less likely to launch one soon, so age discounts; a young protocol still
- * building its launch window earns a small premium. Age is measured from
- * listed_at to the snapshot's date.
- */
-export function maturityFactor(listedAt: string | null, asOf: string): number {
-  if (listedAt === null) return 1;
-  const ageDays = (AS_OF_MS(asOf) - Date.parse(`${listedAt}T00:00:00Z`)) / 86_400_000;
-  if (!Number.isFinite(ageDays) || ageDays < 0) return 1;
-  if (ageDays < 365) return 1.08;
-  if (ageDays < 730) return 1.04;
-  if (ageDays < 1460) return 1;
-  return 0.92;
+function ageYears(asOf: string, listedAt: string | null): number | null {
+  if (listedAt === null) return null;
+  const ms = Date.parse(asOf + 'T00:00:00Z') - Date.parse(listedAt + 'T00:00:00Z');
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  return ms / (365.25 * 24 * 3600 * 1000);
 }
 
-/**
- * Scale adjustment: very large TVL is already priced into expectations, so
- * the biggest protocols discount slightly; small protocols carry more
- * upside per dollar of TVL, so they premium slightly.
- */
-export function scaleFactor(tvlUsd: number): number {
-  if (tvlUsd > 1_000_000_000) return 0.9;
-  if (tvlUsd > 500_000_000) return 0.95;
-  if (tvlUsd >= 100_000_000) return 1;
-  if (tvlUsd >= 25_000_000) return 1.05;
+function tenureFactor(age: number | null): number {
+  if (age === null) return 1.0;
+  if (age < 0.5) return 1.02;
+  if (age < 1.5) return 1.08;
+  if (age < 3) return 1.1;
+  if (age < 5) return 1.04;
+  return 0.94;
+}
+
+function tenureScore(age: number | null): number {
+  if (age === null) return 50;
+  if (age < 0.5) return 40;
+  if (age < 1.5) return 75;
+  if (age < 3) return 100;
+  if (age < 5) return 65;
+  return 35;
+}
+
+function momentumScore(change: number | null): number {
+  if (change === null) return 50;
+  if (change <= -20) return 20;
+  if (change < 0) return 40;
+  if (change < 10) return 60;
+  if (change < 25) return 85;
+  return 100;
+}
+
+function scaleFactor(tvl: number): number {
+  if (tvl > 1_000_000_000) return 0.9;
+  if (tvl > 500_000_000) return 0.95;
+  if (tvl > 100_000_000) return 1.0;
+  if (tvl > 25_000_000) return 1.05;
   return 1.08;
 }
 
-/** Chain-diversity adjustment: a protocol live on more chains reaches more users. */
-export function chainsFactor(chainCount: number): number {
-  if (chainCount >= 4) return 1.08;
-  if (chainCount >= 2) return 1.04;
-  return 1;
+function scaleScore(tvl: number): number {
+  if (tvl > 1_000_000_000) return 100;
+  if (tvl > 500_000_000) return 90;
+  if (tvl > 100_000_000) return 75;
+  if (tvl > 25_000_000) return 55;
+  return 40;
 }
 
-/** All four adjustments together, the product clamped so no protocol moves more than -30% / +35%. */
-export function adjustmentsFor(p: Protocol, asOf: string): Adjustments {
-  const growth = growthFactor(p.change_7d);
-  const maturity = maturityFactor(p.listed_at, asOf);
-  const scale = scaleFactor(p.tvl_usd);
-  const chains = chainsFactor(p.chains.length);
-  const total = Math.max(0.7, Math.min(1.35, growth * maturity * scale * chains));
-  return { growth, maturity, scale, chains, total };
+function chainsFactor(n: number): number {
+  if (n >= 4) return 1.08;
+  if (n >= 2) return 1.04;
+  return 1.0;
 }
 
-// ---------------------------------------------------------------- farm plans
-
-/** The chain a plan centres on: the protocol's largest chain by convention, its first listed. */
-function mainChain(p: Protocol): string {
-  return p.chains[0] ?? 'Ethereum';
+function chainsScore(n: number): number {
+  if (n >= 4) return 100;
+  if (n >= 2) return 70;
+  return 40;
 }
 
-/** A second chain when the protocol runs on more than one, for the cross-chain step. */
-function otherChain(p: Protocol): string | null {
-  return p.chains.length > 1 ? p.chains[1]! : null;
+function benchmarkScore(ratio: number): number {
+  if (ratio >= 0.3) return 100;
+  if (ratio >= 0.15) return 75;
+  if (ratio >= 0.08) return 50;
+  return 30;
 }
 
-function fmtUsd(n: number): string {
-  if (n >= 1_000_000_000) return `$${(n / 1_000_000_000).toFixed(2)}B`;
-  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`;
-  return `$${Math.round(n / 1000)}K`;
-}
-
-/**
- * Farm steps, tailored by category and chain. Every step names the chain and
- * the concrete action, what it costs (gas plus any deposit) and how long it
- * takes — a plan a reader can follow this week, not a slogan. Steps are
- * generated from the protocol's own record, never copied from a list.
- */
-export function farmSteps(p: Protocol): string[] {
-  const name = p.name;
-  const chain = mainChain(p);
-  const other = otherChain(p);
-  const tvl = fmtUsd(p.tvl_usd);
-  const cat = p.category ?? 'DeFi';
-  const steps: string[] = [];
-  const push = (s: string): void => {
-    if (s.length >= 20 && s.length <= 600) steps.push(s);
-  };
-
-  push(
-    `Set up a wallet on ${chain} and fund it with $50-200 in the chain's gas token plus stablecoins; keep $5-10 aside for gas so a later step never strands your position. Takes 15 minutes, costs only gas.`,
-  );
-
-  switch (cat) {
-    case 'Dexs':
-      push(
-        `Swap $20-50 of stablecoins for another asset on ${name} (${chain}) so the router records your address as an active trader; repeat a small swap weekly. Costs gas only, about 5 minutes per swap.`,
-      );
-      push(
-        `Provide liquidity to the busiest pool on ${name} on ${chain} with $50-100 split across the pair, and keep the position open at least 2-4 weeks so volume-based snapshots can see it. Costs gas plus the deposit.`,
-      );
-      break;
-    case 'Lending':
-      push(
-        `Supply $50-100 of a stablecoin or blue-chip asset as collateral on ${name} (${chain}) and leave it supplied for 3-4 weeks; supplied balances are the usual snapshot for lending airdrops. Costs gas plus the deposit.`,
-      );
-      push(
-        `Borrow a small amount ($10-25) against your supply on ${name}, then repay it within a week, so your address shows both sides of the market. Costs gas plus a few cents of interest.`,
-      );
-      break;
-    case 'Yield':
-    case 'Yield Aggregator':
-    case 'Farm':
-      push(
-        `Deposit $50-100 into the highest-TVL vault on ${name} (${chain}) and hold the vault receipt token for at least 3-4 weeks; vault deposits are the standard farming signal. Costs gas plus the deposit.`,
-      );
-      push(
-        `Harvest or compound the vault's yield on ${name} once a week so your address shows repeat interaction, not a single deposit. Costs a few dollars of gas each time, 5 minutes.`,
-      );
-      break;
-    case 'RWA':
-      push(
-        `Deposit $50-100 into ${name}'s tokenised-asset vault on ${chain} and hold the receipt token for 4+ weeks; RWA snapshots reward sticky deposits over large one-off ones. Costs gas plus the deposit.`,
-      );
-      push(
-        `Complete any identity or allowlist step ${name} asks for on ${chain} (usually a wallet signature, no fee) and keep the same wallet for every later action. Takes 10 minutes.`,
-      );
-      break;
-    case 'CDP':
-    case 'CDP Manager':
-      push(
-        `Open a collateralised position on ${name} (${chain}): lock $50-100 of collateral and mint $20-40 of its stable asset, keeping the ratio well above liquidation. Costs gas plus the deposit, 15 minutes.`,
-      );
-      push(
-        `Use the minted stable asset — swap half on ${chain} or supply it back into ${name} — and keep the position open 3-4 weeks. Costs gas only per action.`,
-      );
-      break;
-    case 'Derivatives':
-    case 'Options':
-    case 'Options Vault':
-    case 'Basis Trading':
-      push(
-        `Open a small ($20-50) perpetual or options position on ${name} (${chain}) and close it after a day or two; repeat once a week. Trading volume, not size, is what derivatives snapshots usually count. Costs gas plus margin.`,
-      );
-      push(
-        `If ${name} offers a vault on ${chain}, deposit $25-50 into it for 2-4 weeks as a second signal alongside your trades. Costs gas plus the deposit.`,
-      );
-      break;
-    case 'Bridge':
-    case 'Cross Chain Bridge':
-    case 'Canonical Bridge':
-      push(
-        `Bridge $25-50 from ${chain} to ${other ?? 'another supported chain'} through ${name} and bridge a smaller amount back a few days later; bridge snapshots count distinct routes and repeat use. Costs gas plus the bridge fee, 10-20 minutes.`,
-      );
-      push(
-        `Repeat the bridge once a week with a different asset or destination chain so your address shows sustained cross-chain activity, not a single transfer. Costs gas plus fees each time.`,
-      );
-      break;
-    case 'Restaking':
-    case 'Liquid Restaking':
-      push(
-        `Restake $50-100 of a liquid staking token through ${name} on ${chain} and hold the restaked receipt for 4+ weeks; restaking snapshots reward duration. Costs gas plus the deposit.`,
-      );
-      break;
-    case 'Indexes':
-      push(
-        `Buy $50-100 of ${name}'s index token on ${chain} and hold it for 3-4 weeks; index holders are the natural snapshot for an index protocol. Costs gas plus the purchase.`,
-      );
-      break;
-    case 'Prediction Market':
-      push(
-        `Place small ($5-20) trades on two or three different markets on ${name} (${chain}) and leave at least one open until it resolves; prediction snapshots count distinct markets traded. Costs gas plus the stakes, 10 minutes.`,
-      );
-      break;
-    case 'Launchpad':
-      push(
-        `Join ${name}'s next sale or points campaign on ${chain} with a $25-50 allocation and complete its wallet tasks; launchpad snapshots usually count participation, not size. Costs gas plus the allocation.`,
-      );
-      break;
-    default:
-      push(
-        `Use ${name}'s core product on ${chain} with $50-100 — deposit, supply or stake, whichever it offers — and keep the position open for 3-4 weeks so snapshots can see a sticky user. Costs gas plus the deposit.`,
-      );
-      push(
-        `Return once a week and repeat a small interaction on ${name} (${chain}) — a swap, a claim or a top-up — so your address shows sustained use rather than one visit. Costs a few dollars of gas, 5 minutes.`,
-      );
-      break;
-  }
-
-  if (other !== null) {
-    push(
-      `Repeat your main action on ${name} on ${other} as well, with a smaller $20-30 position, so your address is active on two chains; multi-chain users are the ones cross-chain snapshots favour. Costs gas plus the deposit.`,
-    );
-  }
-  push(
-    `Follow ${name}'s official announcements and any points or quests page it runs, complete the free social or on-chain tasks it lists, and keep using the same wallet — snapshots are taken without warning. Takes 10 minutes a week, costs nothing but gas.`,
-  );
-  push(
-    `Do not chase the launch: ${name} holds ${tvl} of TVL and records no token, so a token may never come. Never pay for a "pre-sale" token, never sign an unlimited approval, and treat this as a free option, not an investment.`,
-  );
-  return steps.slice(0, 8);
-}
-
-// ---------------------------------------------------------------- the board
-
-/**
- * Build the ranked board: every pre-token protocol in the snapshot, ranked
- * by implied value. The watchlist (40) is always included; the rest are the
- * pre-token protocols below the $50M floor, so the board is the whole
- * pre-token universe the snapshot can see, not a hand-picked list.
- */
-export function buildRadar(snapshot: Snapshot): { board: Row[]; radar: Radar } {
-  const watchlist = new Set(snapshot.watchlist);
-  const candidates = snapshot.protocols.filter(isPreToken);
-
-  // Peer benchmarks, per category, from the token-bearing protocols only.
-  const peerRatios = new Map<string, number[]>();
-  const peerMaxMcap = new Map<string, number>();
+export function peerBenchmarks(protocols: SnapshotProtocol[]): {
+  byCategory: Map<string, CategoryBench>;
+  globalMedian: number;
+} {
+  const byCategory = new Map<string, CategoryBench>();
   const allRatios: number[] = [];
-  for (const p of snapshot.protocols) {
+  const cats = new Map<string, SnapshotProtocol[]>();
+  for (const p of protocols) {
+    const key = p.category ?? 'Uncategorised';
+    const arr = cats.get(key);
+    if (arr) arr.push(p);
+    else cats.set(key, [p]);
+  }
+  for (const p of protocols) {
     if (p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0) {
-      const ratio = p.mcap_usd / p.tvl_usd;
-      allRatios.push(ratio);
-      const key = p.category ?? 'Uncategorised';
-      if (!peerRatios.has(key)) peerRatios.set(key, []);
-      peerRatios.get(key)!.push(ratio);
-      peerMaxMcap.set(key, Math.max(peerMaxMcap.get(key) ?? 0, p.mcap_usd));
+      allRatios.push(p.mcap_usd / p.tvl_usd);
     }
   }
-  const globalRatio = median(allRatios);
-
-  const benchmarks: Radar['benchmarks'] = [];
-  for (const [category, ratios] of [...peerRatios.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-    const fallback = ratios.length < 3;
-    benchmarks.push({ category, peers: ratios.length, ratio: fallback ? globalRatio : median(ratios), fallback });
+  const globalMedian = median(allRatios);
+  for (const [cat, members] of cats) {
+    const peerRatios: number[] = [];
+    let maxPeerMcap: number | null = null;
+    const changes: number[] = [];
+    for (const p of members) {
+      if (p.change_7d !== null) changes.push(p.change_7d);
+      if (p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0) {
+        peerRatios.push(p.mcap_usd / p.tvl_usd);
+        maxPeerMcap = maxPeerMcap === null ? p.mcap_usd : Math.max(maxPeerMcap, p.mcap_usd);
+      }
+    }
+    byCategory.set(cat, {
+      peers: peerRatios.length,
+      median_ratio: peerRatios.length >= 3 ? Math.min(median(peerRatios), 2.0) : globalMedian,
+      median_change: changes.length > 0 ? median(changes) : null,
+      max_peer_mcap: maxPeerMcap,
+    });
   }
+  return { byCategory, globalMedian };
+}
 
-  const scored: Row[] = candidates.map((p) => {
-    const key = p.category ?? 'Uncategorised';
-    const peers = peerRatios.get(key) ?? [];
-    const fallback = peers.length < 3;
-    const ratio = fallback ? globalRatio : median(peers);
-    const base = p.tvl_usd * ratio;
-    const adjustments = adjustmentsFor(p, snapshot.as_of);
-    const maxMcap = peerMaxMcap.get(key) ?? null;
-    const cap = maxMcap === null ? 10_000_000_000 : Math.min(10_000_000_000, 2 * maxMcap);
-    const raw = base * adjustments.total;
-    const capped = raw > cap;
-    const implied = Math.max(1, Math.round(Math.min(raw, cap) / 10_000) * 10_000);
+export function buildBoard(snapshot: Snapshot): {
+  rows: BoardRow[];
+  meta: {
+    model: string;
+    snapshot_as_of: string;
+    floor_usd: number;
+    watchlist_size: number;
+    pre_token_count: number;
+    global_median_ratio: number;
+    benchmarks: Record<string, CategoryBench>;
+    methodology: string;
+  };
+} {
+  const { byCategory, globalMedian } = peerBenchmarks(snapshot.protocols);
+  const watchlist = new Set(snapshot.watchlist);
+  const pre = snapshot.protocols.filter(isPreToken);
+
+  const scored: BoardRow[] = pre.map((p) => {
+    const bench = byCategory.get(p.category ?? 'Uncategorised')!;
+    const base = p.tvl_usd * bench.median_ratio;
+    const change = p.change_7d ?? 0;
+    const growth = 1 + clamp(change, -50, 50) / 250;
+    const rel = bench.median_change === null ? 0 : change - bench.median_change;
+    const momentum = rel > 10 ? 1.05 : rel < -10 ? 0.95 : 1.0;
+    const age = ageYears(snapshot.as_of, p.listed_at);
+    const tenure = tenureFactor(age);
+    const scale = scaleFactor(p.tvl_usd);
+    const chains = chainsFactor(p.chains.length);
+    const adjustment = clamp(growth * momentum * tenure * scale * chains, 0.7, 1.4);
+    // The cap only binds where the category has a real market to compare
+    // against: twice the largest peer market cap, when the category has
+    // three or more token-bearing peers. A category with fewer peers falls
+    // back to the global median for its benchmark already; capping it at
+    // twice one peer's market cap would let a single small token dictate
+    // the value of the category's giants. Otherwise the cap is $10B.
+    const cap =
+      bench.peers >= 3 && bench.max_peer_mcap !== null
+        ? Math.min(10_000_000_000, 2 * bench.max_peer_mcap)
+        : 10_000_000_000;
+    let value = Math.round(Math.min(base * adjustment, cap) / 10_000) * 10_000;
+    if (value < 10_000) value = 10_000;
+
+    const parts = {
+      tenure: tenureScore(age),
+      momentum: momentumScore(p.change_7d),
+      scale: scaleScore(p.tvl_usd),
+      chains: chainsScore(p.chains.length),
+      benchmark: benchmarkScore(bench.median_ratio),
+    };
+    const readiness = Math.round(
+      parts.tenure * 0.3 + parts.momentum * 0.25 + parts.scale * 0.2 + parts.chains * 0.15 + parts.benchmark * 0.1,
+    );
+
     return {
       slug: p.slug,
       name: p.name,
       rank: 0,
-      implied_value_usd: implied,
-      farm_steps: farmSteps(p),
-      category: p.category ?? 'Uncategorised',
+      implied_value_usd: value,
+      farm_steps: Farm.stepsFor(p),
+      category: p.category,
       chains: p.chains,
       tvl_usd: p.tvl_usd,
       change_7d: p.change_7d,
       listed_at: p.listed_at,
       watchlist: watchlist.has(p.slug),
+      readiness,
+      readiness_parts: parts,
+      benchmark_ratio: bench.median_ratio,
+      benchmark_peers: bench.peers,
       base_value_usd: Math.round(base),
-      peer_ratio: ratio,
-      peer_count: peers.length,
-      peer_fallback: fallback,
-      peer_max_mcap_usd: maxMcap,
-      adjustments,
-      capped,
+      adjustment: Math.round(adjustment * 1000) / 1000,
+      category_median_change: bench.median_change,
+      factors: {
+        growth: Math.round(growth * 1000) / 1000,
+        momentum: Math.round(momentum * 1000) / 1000,
+        tenure: Math.round(tenure * 1000) / 1000,
+        scale: Math.round(scale * 1000) / 1000,
+        chains: Math.round(chains * 1000) / 1000,
+      },
     };
   });
 
-  // Rank by implied value, highest first; TVL breaks ties so the order is stable.
-  scored.sort((a, b) => b.implied_value_usd - a.implied_value_usd || b.tvl_usd - a.tvl_usd || a.slug.localeCompare(b.slug));
-  // Rounding can tie neighbours; nudge a tied row down one rounding step so
-  // the value never rises as rank ascends and the ranking stays a ranking.
+  // Rank by implied value. Ties break by readiness, then TVL, then slug,
+  // so the order is stable and a tie still says something.
+  scored.sort(
+    (a, b) =>
+      b.implied_value_usd - a.implied_value_usd ||
+      b.readiness - a.readiness ||
+      b.tvl_usd - a.tvl_usd ||
+      (a.slug < b.slug ? -1 : 1),
+  );
+  // Values never rise as rank ascends.
   for (let i = 1; i < scored.length; i++) {
-    if (scored[i]!.implied_value_usd >= scored[i - 1]!.implied_value_usd) {
-      scored[i]!.implied_value_usd = Math.max(1, scored[i - 1]!.implied_value_usd - 10_000);
+    if (scored[i]!.implied_value_usd > scored[i - 1]!.implied_value_usd) {
+      scored[i]!.implied_value_usd = scored[i - 1]!.implied_value_usd;
     }
   }
-  scored.forEach((row, i) => {
-    row.rank = i + 1;
+  scored.forEach((r, i) => {
+    r.rank = i + 1;
   });
 
-  const radar: Radar = {
-    as_of: snapshot.as_of,
+  const benchmarks: Record<string, CategoryBench> = {};
+  for (const [cat, b] of [...byCategory.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    benchmarks[cat] = {
+      peers: b.peers,
+      median_ratio: Math.round(b.median_ratio * 10000) / 10000,
+      median_change: b.median_change === null ? null : Math.round(b.median_change * 100) / 100,
+      max_peer_mcap: b.max_peer_mcap,
+    };
+  }
+
+  return {
     rows: scored,
-    watchlist_size: snapshot.watchlist.length,
-    early_size: scored.length - snapshot.watchlist.length,
-    live_size: snapshot.protocols.length - candidates.length,
-    global_peer_ratio: globalRatio,
-    benchmarks,
+    meta: {
+      model: 'token-radar v3: category peer-median benchmark, bounded adjustments, readiness score',
+      snapshot_as_of: snapshot.as_of,
+      floor_usd: snapshot.floor_usd,
+      watchlist_size: snapshot.watchlist.length,
+      pre_token_count: pre.length,
+      global_median_ratio: Math.round(globalMedian * 10000) / 10000,
+      benchmarks,
+      methodology:
+        'Implied value = TVL x the median market-cap/TVL ratio of token-bearing peers in the same category ' +
+        '(global median when a category has fewer than 3 peers), times bounded adjustments for 7-day growth, ' +
+        'growth against the category median, token-less tenure, TVL scale and chain breadth (product clamped ' +
+        '0.70-1.40), capped at $10B, or at twice the largest peer market cap where the category has 3 or more ' +
+        'peers. Readiness (0-100) scores tenure 30%, momentum 25%, scale 20%, chain breadth 15% and benchmark ' +
+        'strength 10%.',
+    },
   };
-  return { board: scored, radar };
-}
-
-/** The gate's own shape, checked before anything is written. */
-export function boardIssue(board: Row[], snapshot: Snapshot): string | null {
-  if (board.length < 100 || board.length > 4000) return `board holds ${board.length} rows, outside 100-4000`;
-  const slugs = new Set(snapshot.protocols.map((p) => p.slug));
-  const seen = new Set<string>();
-  for (const row of board) {
-    if (!slugs.has(row.slug)) return `row names ${row.slug}, not in the snapshot`;
-    if (seen.has(row.slug)) return `slug ${row.slug} appears twice`;
-    seen.add(row.slug);
-    if (!Number.isInteger(row.implied_value_usd) || row.implied_value_usd <= 0) return `row ${row.slug} has a bad implied value`;
-    if (row.farm_steps.length < 3 || row.farm_steps.length > 12) return `row ${row.slug} has ${row.farm_steps.length} farm steps`;
-    for (const step of row.farm_steps) {
-      const t = step.trim();
-      if (t.length < 20 || t.length > 600) return `row ${row.slug} has a farm step of ${t.length} characters`;
-    }
-  }
-  for (const slug of snapshot.watchlist) {
-    if (!seen.has(slug)) return `watchlist slug ${slug} is missing`;
-  }
-  const ranks = board.map((r) => r.rank).sort((a, b) => a - b);
-  for (let i = 0; i < ranks.length; i++) if (ranks[i] !== i + 1) return `ranks are not 1..${board.length}`;
-  for (let i = 1; i < board.length; i++) {
-    if (board[i]!.implied_value_usd > board[i - 1]!.implied_value_usd) return 'implied value rises with rank';
-  }
-  return null;
-}
-
-/** data.js: the dashboard's data, one global, written beside the page. */
-export function dataScript(radar: Radar): string {
-  return `window.RADAR=${JSON.stringify(radar)};\n`;
 }
